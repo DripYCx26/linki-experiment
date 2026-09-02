@@ -12,6 +12,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
                 w.name as workflow_name,
                 l.name as list_name,
                 a.name as account_name,
+                ma.name as main_account_name,
                 COUNT(DISTINCT rp.id) as total_profiles,
                 COUNT(DISTINCT CASE WHEN NOT EXISTS (
                   SELECT 1 FROM run_profile_tracks rt2
@@ -24,6 +25,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
          LEFT JOIN workflows w ON w.id = r.workflow_id
          LEFT JOIN lists l ON l.id = r.list_id
          LEFT JOIN accounts a ON a.id = r.account_id
+         LEFT JOIN accounts ma ON ma.id = r.main_account_id
          LEFT JOIN run_profiles rp ON rp.run_id = r.id
          GROUP BY r.id
          ORDER BY r.created_at DESC`
@@ -33,9 +35,48 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   if (req.method === "POST") {
-    const { workflow_id, list_id, account_id, email_account_id, email_account_ids, target_ids } = req.body;
+    const { workflow_id, list_id, account_id, main_account_id, email_account_id, email_account_ids, target_ids } = req.body;
     if (!workflow_id || !list_id || !account_id)
       return res.status(400).json({ error: "workflow_id, list_id, account_id required" });
+
+    // Introduction handoffs deliberately use two LinkedIn identities. Ordinary
+    // runs keep the historical single-account behavior and do not need roles.
+    const hasIntroductionHandoff = !!db.prepare(
+      "SELECT 1 FROM workflow_steps WHERE workflow_id = ? AND step_type = 'introduction_handoff' LIMIT 1"
+    ).get(workflow_id);
+    let mainAccountId: string | null = null;
+    if (hasIntroductionHandoff) {
+      if (typeof main_account_id !== "string" || !main_account_id.trim()) {
+        return res.status(400).json({
+          error: "main_account_id_required",
+          message: "Choose the account with the main role for an introduction handoff.",
+        });
+      }
+      mainAccountId = main_account_id.trim();
+      if (mainAccountId === account_id) {
+        return res.status(400).json({
+          error: "main_account_must_differ",
+          message: "The introducer and main accounts must be different for an introduction handoff.",
+        });
+      }
+
+      const introducer = db.prepare("SELECT id, role, is_authenticated FROM accounts WHERE id = ?").get(account_id) as
+        { id: string; role: string | null; is_authenticated: number } | undefined;
+      const main = db.prepare("SELECT id, role, is_authenticated FROM accounts WHERE id = ?").get(mainAccountId) as
+        { id: string; role: string | null; is_authenticated: number } | undefined;
+      if (!introducer || introducer.role !== "introducer" || !introducer.is_authenticated) {
+        return res.status(400).json({
+          error: "introducer_account_required",
+          message: "The run account must be an authenticated account with the introducer role.",
+        });
+      }
+      if (!main || main.role !== "main" || !main.is_authenticated) {
+        return res.status(400).json({
+          error: "main_account_invalid",
+          message: "main_account_id must reference an authenticated account with the main role.",
+        });
+      }
+    }
 
     // Normalise email account list — prefer the new array, fall back to legacy single-id
     const emailAccountPool: string[] = Array.isArray(email_account_ids) && email_account_ids.length > 0
@@ -56,8 +97,8 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     const runId = randomUUID();
     // For backwards compat, store first email account on the run row (may be null for no-email campaigns)
     db
-      .prepare("INSERT INTO runs (id, workflow_id, list_id, account_id, email_account_id) VALUES (?, ?, ?, ?, ?)")
-      .run(runId, workflow_id, list_id, account_id, emailAccountPool[0] ?? null);
+      .prepare("INSERT INTO runs (id, workflow_id, list_id, account_id, main_account_id, email_account_id) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(runId, workflow_id, list_id, account_id, mainAccountId, emailAccountPool[0] ?? null);
 
     // Create run_profiles — either for selected targets or all targets in the list
     const candidates: { target_id: string }[] = Array.isArray(target_ids) && target_ids.length > 0
@@ -99,7 +140,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
 
     // Assign email accounts: company-grouped round-robin
     // All targets at the same company get the same sender; companies cycle through the pool
-    let emailAssignment: Map<string, string | null> = new Map();
+    const emailAssignment: Map<string, string | null> = new Map();
     if (emailAccountPool.length > 0) {
       // Load company_id for each candidate target
       const targetIds = targets.map(t => t.target_id);

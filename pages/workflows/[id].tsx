@@ -36,8 +36,9 @@ import {
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type StepType = "visit" | "connect" | "message" | "sales_inmail" | "delay" | "email";
+type StepType = "visit" | "connect" | "message" | "sales_inmail" | "delay" | "wait_for_reply" | "introduction_handoff" | "email";
 type Track = "linkedin" | "email";
+type DelayUnit = "seconds" | "minutes" | "days";
 
 interface Step {
   id: string;
@@ -53,6 +54,7 @@ interface Step {
   message_body: string | null;
   email_subject: string | null;
   email_body: string | null;
+  config_json: string | null;
 }
 
 interface WorkflowData {
@@ -128,6 +130,7 @@ interface Account {
   connections_today: number;
   messages_today: number;
   inmails_today: number;
+  role?: "introducer" | "main" | null;
 }
 
 interface Template {
@@ -152,6 +155,8 @@ const STEP_ICONS: Record<string, React.ReactNode> = {
   message: <RiMessage2Line size={15} />,
   sales_inmail: <RiSendPlaneLine size={15} />,
   delay: <RiTimeLine size={15} />,
+  wait_for_reply: <RiMessage2Line size={15} />,
+  introduction_handoff: <RiUser3Line size={15} />,
   email: <RiMailLine size={15} />,
 };
 
@@ -161,6 +166,8 @@ const STEP_LABELS: Record<string, string> = {
   connect: "LinkedIn Connect",
   message: "LinkedIn Message",
   sales_inmail: "Sales Nav InMail",
+  wait_for_reply: "Wait for LinkedIn Reply",
+  introduction_handoff: "Introduction Handoff",
   email: "Cold Email",
 };
 
@@ -193,6 +200,8 @@ const STEP_COLORS: Record<string, string> = {
   connect: "bg-primary/10 text-primary border-primary/20",
   message: "bg-success/10 text-success border-success/20",
   sales_inmail: "bg-primary/10 text-primary border-primary/20",
+  wait_for_reply: "bg-info/10 text-info border-info/20",
+  introduction_handoff: "bg-success/10 text-success border-success/20",
   email: "bg-warning/10 text-warning border-warning/20",
 };
 
@@ -217,6 +226,24 @@ function formatNextAction(next_step_at: string | null, state: string): string {
   const hours = diff / 3600_000;
   if (hours < 24) return `in ${Math.round(hours)}h`;
   return `in ${Math.round(hours / 24)}d`;
+}
+
+function formatDelay(seconds: number): string {
+  if (seconds <= 0) return "Immediately";
+  if (seconds % 86400 === 0) return `Wait ${seconds / 86400}d`;
+  if (seconds % 3600 === 0) return `Wait ${seconds / 3600}h`;
+  if (seconds % 60 === 0) return `Wait ${seconds / 60}m`;
+  return `Wait ${seconds}s`;
+}
+
+function defaultDelayUnit(seconds: number): DelayUnit {
+  if (seconds > 0 && seconds % 86400 === 0) return "days";
+  if (seconds > 0 && seconds % 60 === 0) return "minutes";
+  return "seconds";
+}
+
+function delayUnitSeconds(unit: DelayUnit): number {
+  return unit === "days" ? 86400 : unit === "minutes" ? 60 : 1;
 }
 
 // ─── Server-side ──────────────────────────────────────────────────────────────
@@ -264,7 +291,7 @@ export const getServerSideProps: GetServerSideProps = async ({ params, query }) 
     .all();
   const accounts = db
     .prepare(
-      `SELECT a.id, a.name, a.is_authenticated, a.daily_connection_limit, a.daily_message_limit, a.daily_inmail_limit,
+      `SELECT a.id, a.name, a.role, a.is_authenticated, a.daily_connection_limit, a.daily_message_limit, a.daily_inmail_limit,
          (SELECT COUNT(*) FROM logs l JOIN runs r ON r.id = l.run_id
           WHERE r.account_id = a.id AND l.message LIKE 'Connection request sent%' AND date(l.created_at) = date('now')) as connections_today,
          (SELECT COUNT(*) FROM logs l JOIN runs r ON r.id = l.run_id
@@ -312,8 +339,8 @@ type WizardPage = "prospects" | "prompt" | "linkedin-steps" | "email-steps" | "a
 
 interface WizardStep {
   track: Track;
-  type: "visit" | "connect" | "message" | "sales_inmail" | "email";
-  delayDaysBefore: number; // delay before this step (0 for first step within its track)
+  type: "visit" | "connect" | "message" | "sales_inmail" | "wait_for_reply" | "introduction_handoff" | "email";
+  delaySecondsBefore: number; // canonical delay before this step (0 for first step within its track)
   connectNote: string;
   messageBody: string;
   templateId: string | null;       // legacy single-template (kept for backwards compat)
@@ -328,6 +355,10 @@ interface WizardStep {
   aiMaxWordsEnabled: boolean;
   aiMaxWords: number;
   aiLanguage: string;
+  handoffPreGroupMessage: string;
+  handoffGroupTitle: string;
+  handoffIntroducerGroupMessage: string;
+  handoffMainGroupMessage: string;
 }
 
 function buildWizardSteps(steps: Step[]): WizardStep[] {
@@ -337,13 +368,21 @@ function buildWizardSteps(steps: Step[]): WizardStep[] {
   for (const s of steps) {
     const track: Track = s.track ?? (s.step_type === "email" ? "email" : "linkedin");
     if (s.step_type === "delay") {
-      pendingDelay[track] = Math.round(s.delay_seconds / 86400);
+      pendingDelay[track] = s.delay_seconds;
     } else {
       const raw = s as unknown as Record<string, unknown>;
+      let handoffConfig: Record<string, unknown> = {};
+      if (s.step_type === "introduction_handoff" && typeof raw.config_json === "string") {
+        try {
+          handoffConfig = JSON.parse(raw.config_json) as Record<string, unknown>;
+        } catch {
+          // Leave defaults in place when older/invalid persisted configuration cannot be parsed.
+        }
+      }
       result.push({
         track,
-        type: s.step_type as "visit" | "connect" | "message" | "sales_inmail" | "email",
-        delayDaysBefore: pendingDelay[track] ?? 0,
+        type: s.step_type as WizardStep["type"],
+        delaySecondsBefore: pendingDelay[track] ?? 0,
         connectNote: s.connect_note ?? "",
         messageBody: s.message_body ?? "",
         templateId: s.template_id ?? null,
@@ -357,6 +396,10 @@ function buildWizardSteps(steps: Step[]): WizardStep[] {
         aiMaxWordsEnabled: !!(raw.ai_max_words),
         aiMaxWords: (raw.ai_max_words as number) ?? 100,
         aiLanguage: (raw.ai_language as string) ?? "English",
+        handoffPreGroupMessage: (handoffConfig.pre_group_message as string) ?? "Hey, I'm creating a group chat with you and Dreach",
+        handoffGroupTitle: (handoffConfig.group_title as string) ?? "Dreach <> {{first_name}}",
+        handoffIntroducerGroupMessage: (handoffConfig.introducer_group_message as string) ?? "Hey, Kabir is building in this space, you should connect",
+        handoffMainGroupMessage: (handoffConfig.main_group_message as string) ?? "Hey {{first_name}}, how are you doing?",
       });
       pendingDelay[track] = 0;
     }
@@ -551,6 +594,8 @@ function Wizard({
   const [campaignPrompt, setCampaignPrompt] = useState(initialPrompt);
   const [listId, setListId] = useState("");
   const [accountId, setAccountId] = useState("");
+  const [mainAccountId, setMainAccountId] = useState("");
+  const [delayUnits, setDelayUnits] = useState<Record<number, DelayUnit>>({});
   const [emailAccountIds, setEmailAccountIds] = useState<Set<string>>(new Set(activeRunEmailAccountIds));
   const [conflicts, setConflicts] = useState<{ total: number; blocked: number } | null>(null);
   const [conflictsLoading, setConflictsLoading] = useState(false);
@@ -672,7 +717,8 @@ function Wizard({
   // In add-contacts mode every contact in the list is "active" already (this run) — dedup happens server-side.
   const allBlocked = !isAddContacts && conflicts !== null && conflicts.blocked > 0 && conflicts.blocked >= conflicts.total;
   const hasEmailStep = wizardSteps.some((s) => s.type === "email");
-  const hasLinkedInStep = wizardSteps.some((s) => s.type === "visit" || s.type === "connect" || s.type === "message" || s.type === "sales_inmail");
+  const hasLinkedInStep = wizardSteps.some((s) => s.type === "visit" || s.type === "connect" || s.type === "message" || s.type === "sales_inmail" || s.type === "wait_for_reply" || s.type === "introduction_handoff");
+  const hasIntroductionHandoff = wizardSteps.some((s) => s.type === "introduction_handoff");
 
   async function selectList(id: string) {
     setListId(id);
@@ -732,12 +778,20 @@ function Wizard({
 
   const hasConnect = wizardSteps.some((s) => s.type === "connect");
 
-  async function addWizardStep(type: "visit" | "connect" | "message" | "sales_inmail" | "email") {
+  async function addWizardStep(type: WizardStep["type"]) {
     const track: Track = type === "email" ? "email" : "linkedin";
     setWizardSteps((prev) => {
       const trackSteps = prev.filter((s) => s.track === track);
       const isFirstInTrack = trackSteps.length === 0;
-      const newStep: WizardStep = { track, type, delayDaysBefore: isFirstInTrack ? 0 : 1, connectNote: "", messageBody: "", templateId: null, templateIds: [], emailSubject: "", emailBody: "", emailSignature: null, aiEnabled: false, aiModel: "", aiPrompt: "", aiMaxWordsEnabled: false, aiMaxWords: 100, aiLanguage: "English" };
+      const newStep: WizardStep = {
+        track, type, delaySecondsBefore: isFirstInTrack ? 0 : 86400,
+        connectNote: "", messageBody: "", templateId: null, templateIds: [], emailSubject: "", emailBody: "", emailSignature: null,
+        aiEnabled: false, aiModel: "", aiPrompt: "", aiMaxWordsEnabled: false, aiMaxWords: 100, aiLanguage: "English",
+        handoffPreGroupMessage: "Hey, I'm creating a group chat with you and Dreach",
+        handoffGroupTitle: "Dreach <> {{first_name}}",
+        handoffIntroducerGroupMessage: "Hey, Kabir is building in this space, you should connect",
+        handoffMainGroupMessage: "Hey {{first_name}}, how are you doing?",
+      };
 
       if (type === "connect") {
         // Insert before the first linkedin message step
@@ -794,17 +848,18 @@ function Wizard({
     // Re-calculate positions independently
     emailPosition = 1; messagePosition = 1;
     for (const ws of allOrdered) {
-      if (ws.delayDaysBefore > 0) {
+      if (ws.delaySecondsBefore > 0) {
         await fetch(`/api/workflows/${workflowId}/steps`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ step_type: "delay", track: ws.track, delay_seconds: ws.delayDaysBefore * 86400 }),
+          body: JSON.stringify({ step_type: "delay", track: ws.track, delay_seconds: ws.delaySecondsBefore }),
         });
       }
       const isEmail = ws.type === "email";
       const isInMail = ws.type === "sales_inmail";
       // sales_inmail behaves like message (body + optional AI + templates) plus a subject.
       const isMessage = ws.type === "message" || isInMail;
+      const isHandoff = ws.type === "introduction_handoff";
       const hasAI = isMessage || isEmail;
       await fetch(`/api/workflows/${workflowId}/steps`, {
         method: "POST",
@@ -827,6 +882,12 @@ function Wizard({
           ai_prompt: hasAI ? (ws.aiPrompt || null) : null,
           ai_max_words: hasAI && ws.aiEnabled && ws.aiMaxWordsEnabled ? ws.aiMaxWords : null,
           ai_language: hasAI ? (ws.aiLanguage || "English") : null,
+          config_json: isHandoff ? JSON.stringify({
+            pre_group_message: ws.handoffPreGroupMessage,
+            group_title: ws.handoffGroupTitle,
+            introducer_group_message: ws.handoffIntroducerGroupMessage,
+            main_group_message: ws.handoffMainGroupMessage,
+          }) : null,
         }),
       });
       if (isEmail) emailPosition++;
@@ -869,6 +930,10 @@ function Wizard({
   async function launch() {
     if (wizardSteps.length === 0) { toast.error("Add at least one step"); return; }
     if (selectedTargetIds.size === 0) { toast.error("Select at least one prospect"); return; }
+    if (hasIntroductionHandoff && (!accountId || !mainAccountId || accountId === mainAccountId)) {
+      toast.error("Choose distinct authenticated introducer and main accounts for the handoff");
+      return;
+    }
     await saveStepsToDB();
     setLaunching(true);
     const body: Record<string, unknown> = {
@@ -877,6 +942,7 @@ function Wizard({
       account_id: accountId,
       email_account_ids: Array.from(emailAccountIds),
     };
+    if (hasIntroductionHandoff) body.main_account_id = mainAccountId;
     if (prospectMode === "manual") body.target_ids = Array.from(selectedTargetIds);
     const runRes = await fetch("/api/runs", {
       method: "POST",
@@ -962,7 +1028,7 @@ function Wizard({
     if (p === "linkedin-steps") return prospectsReady;
     if (p === "email-steps") return prospectsReady;
     if (p === "account") return prospectsReady && stepsReady;
-    if (p === "summary") return prospectsReady && stepsReady && !!accountId;
+    if (p === "summary") return prospectsReady && stepsReady && !!accountId && (!hasIntroductionHandoff || (!!mainAccountId && mainAccountId !== accountId));
     return false;
   }
 
@@ -1278,7 +1344,7 @@ function Wizard({
                             <div className="w-px h-2 bg-base-300/60" />
                           </div>
                           <span className="text-xs text-base-content/30">
-                            {ws.delayDaysBefore > 0 ? `Wait ${ws.delayDaysBefore}d` : "Immediately"}
+                            {formatDelay(ws.delaySecondsBefore)}
                           </span>
                         </div>
                       )}
@@ -1362,7 +1428,7 @@ function Wizard({
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="text-xs text-base-content/30 mr-1">Add step:</span>
                       {track === "linkedin"
-                        ? (["visit", "connect", "message", "sales_inmail"] as const)
+                        ? (["visit", "connect", "message", "wait_for_reply", "introduction_handoff", "sales_inmail"] as const)
                             // Sales Nav InMail is a premium feature — hide from the picker in the public build.
                             .filter((type) => type !== "sales_inmail" || hasPremium)
                             .map((type) => {
@@ -1395,18 +1461,18 @@ function Wizard({
 
                   <div className="mb-8">
                       <div className="mb-3">
-                        <h3 className="text-base font-semibold">LinkedIn account</h3>
+                        <h3 className="text-base font-semibold">{hasIntroductionHandoff ? "Introducer account" : "LinkedIn account"}</h3>
                         {!hasLinkedInStep && (
                           <p className="text-xs text-base-content/40 mt-0.5">Required for automation even on email-only workflows.</p>
                         )}
                       </div>
                       <div className="flex flex-col gap-2">
-                        {accounts.filter((a) => a.is_authenticated).length === 0 ? (
+                        {accounts.filter((a) => a.is_authenticated && (!hasIntroductionHandoff || a.role === "introducer")).length === 0 ? (
                           <p className="text-sm text-warning">
-                            No authenticated accounts.{" "}
-                            <Link href="/settings?tab=linkedin" className="underline">Authenticate one first.</Link>
+                            {hasIntroductionHandoff ? "No authenticated account has the introducer role." : "No authenticated accounts."}{" "}
+                            <Link href="/settings?tab=linkedin" className="underline">Configure one first.</Link>
                           </p>
-                        ) : accounts.filter((a) => a.is_authenticated).map((a) => {
+                        ) : accounts.filter((a) => a.is_authenticated && (!hasIntroductionHandoff || a.role === "introducer")).map((a) => {
                           const connLeft = a.daily_connection_limit - a.connections_today;
                           const msgLeft = a.daily_message_limit - a.messages_today;
                           const inmailLeft = a.daily_inmail_limit - a.inmails_today;
@@ -1424,7 +1490,7 @@ function Wizard({
                                 {a.name.charAt(0).toUpperCase()}
                               </span>
                               <div className="flex-1 min-w-0">
-                                <p className={`font-medium text-sm ${accountId === String(a.id) ? "text-primary" : ""}`}>{a.name}</p>
+                                <p className={`font-medium text-sm ${accountId === String(a.id) ? "text-primary" : ""}`}>{a.name}{a.role ? <span className="ml-1.5 text-[10px] uppercase tracking-wide text-base-content/35">{a.role}</span> : null}</p>
                                 <p className="text-xs text-base-content/40">{connLeft} connections left today · {msgLeft} messages left today · {inmailLeft} InMails left today</p>
                               </div>
                               {accountId === String(a.id) && <span className="ml-auto text-primary text-xs font-semibold shrink-0">Selected</span>}
@@ -1433,6 +1499,40 @@ function Wizard({
                         })}
                       </div>
                   </div>
+
+                  {hasIntroductionHandoff && (
+                    <div className="mb-8">
+                      <div className="mb-3">
+                        <h3 className="text-base font-semibold">Main account</h3>
+                        <p className="text-xs text-base-content/40 mt-0.5">Required for the group handoff. Choose a different authenticated account from the introducer.</p>
+                      </div>
+                      <div className="flex flex-col gap-2">
+                        {accounts.filter((a) => a.is_authenticated && a.role === "main" && String(a.id) !== accountId).map((a) => (
+                          <button
+                            key={a.id}
+                            onClick={() => setMainAccountId(String(a.id))}
+                            className={`flex items-center gap-4 px-4 py-3 rounded-xl border transition-colors text-left ${
+                              mainAccountId === String(a.id)
+                                ? "bg-success/10 border-success/40"
+                                : "bg-base-200 border-base-300/50 hover:border-base-300"
+                            }`}
+                          >
+                            <span className={`w-10 h-10 rounded-lg flex items-center justify-center text-sm font-bold shrink-0 ${mainAccountId === String(a.id) ? "bg-success text-success-content" : "bg-base-300 text-base-content/60"}`}>
+                              {a.name.charAt(0).toUpperCase()}
+                            </span>
+                            <div className="flex-1 min-w-0">
+                              <p className={`font-medium text-sm ${mainAccountId === String(a.id) ? "text-success" : ""}`}>{a.name}{a.role ? <span className="ml-1.5 text-[10px] uppercase tracking-wide text-base-content/35">{a.role}</span> : null}</p>
+                              <p className="text-xs text-base-content/40">{a.daily_message_limit - a.messages_today} messages left today</p>
+                            </div>
+                            {mainAccountId === String(a.id) && <span className="ml-auto text-success text-xs font-semibold shrink-0">Selected</span>}
+                          </button>
+                        ))}
+                        {accounts.filter((a) => a.is_authenticated && a.role === "main" && String(a.id) !== accountId).length === 0 && (
+                          <p className="text-sm text-warning">Authenticate a different account with the main role to use an introduction handoff.</p>
+                        )}
+                      </div>
+                    </div>
+                  )}
 
                   {hasEmailStep && (
                     <div>
@@ -1548,8 +1648,14 @@ function Wizard({
                         </div>
                         {selectedAccount && (
                           <div className="grid grid-cols-2 px-5 py-3 text-sm">
-                            <span className="text-base-content/50">LinkedIn</span>
+                            <span className="text-base-content/50">{hasIntroductionHandoff ? "Introducer" : "LinkedIn"}</span>
                             <span className="font-medium text-right">{selectedAccount.name}</span>
+                          </div>
+                        )}
+                        {hasIntroductionHandoff && (
+                          <div className="grid grid-cols-2 px-5 py-3 text-sm">
+                            <span className="text-base-content/50">Main account</span>
+                            <span className="font-medium text-right">{accounts.find((account) => String(account.id) === mainAccountId)?.name ?? "Not selected"}</span>
                           </div>
                         )}
                         {hasEmailStep && (
@@ -1589,9 +1695,9 @@ function Wizard({
                                 const colorClass = STEP_COLORS[ws.type] ?? "bg-base-300/30 text-base-content/50 border-base-300/30";
                                 return (
                                   <div key={i}>
-                                    {ws.delayDaysBefore > 0 && (
+                                    {ws.delaySecondsBefore > 0 && (
                                       <div className="flex items-center gap-1.5 text-xs text-base-content/25 px-5 py-1.5 bg-base-300/20">
-                                        <RiTimeLine size={10} /> Wait {ws.delayDaysBefore}d
+                                        <RiTimeLine size={10} /> {formatDelay(ws.delaySecondsBefore)}
                                       </div>
                                     )}
                                     <div className="px-5 py-2.5 flex items-center gap-3">
@@ -1637,9 +1743,9 @@ function Wizard({
                                 const colorClass = STEP_COLORS[ws.type] ?? "bg-base-300/30 text-base-content/50 border-base-300/30";
                                 return (
                                   <div key={i}>
-                                    {ws.delayDaysBefore > 0 && (
+                                    {ws.delaySecondsBefore > 0 && (
                                       <div className="flex items-center gap-1.5 text-xs text-base-content/25 px-5 py-2 bg-base-300/20">
-                                        <RiTimeLine size={10} /> Wait {ws.delayDaysBefore}d
+                                        <RiTimeLine size={10} /> {formatDelay(ws.delaySecondsBefore)}
                                       </div>
                                     )}
                                     <div className="px-5 py-3 flex items-center gap-3">
@@ -1775,7 +1881,7 @@ function Wizard({
                 disabled={
                   (page === "prospects" && (!prospectsReady || conflictsLoading)) ||
                   (page === "email-steps" && wizardSteps.length === 0) ||
-                  (page === "account" && !accountId)
+                  (page === "account" && (!accountId || (hasIntroductionHandoff && (!mainAccountId || mainAccountId === accountId))))
                 }
                 onClick={() => setPage(pages[pageIdx + 1])}
               >
@@ -1785,7 +1891,7 @@ function Wizard({
               <button
                 className="inline-flex items-center gap-1.5 px-8 py-1.5 rounded-lg text-sm font-medium bg-primary text-primary-content hover:bg-primary/90 transition-colors disabled:opacity-40"
                 onClick={launch}
-                disabled={launching}
+                disabled={launching || (hasIntroductionHandoff && (!mainAccountId || mainAccountId === accountId))}
               >
                 {launching
                   ? <><span className="loading loading-spinner loading-xs" /> Launching...</>
@@ -1836,10 +1942,18 @@ function Wizard({
                       type="number"
                       min={0}
                       className="input input-xs input-bordered w-16 bg-base-300/50 text-xs text-center"
-                      value={ws.delayDaysBefore}
-                      onChange={(e) => updateStep(idx, { delayDaysBefore: Number(e.target.value) })}
+                      value={ws.delaySecondsBefore / delayUnitSeconds(delayUnits[idx] ?? defaultDelayUnit(ws.delaySecondsBefore))}
+                      onChange={(e) => updateStep(idx, { delaySecondsBefore: Math.max(0, Number(e.target.value) || 0) * delayUnitSeconds(delayUnits[idx] ?? defaultDelayUnit(ws.delaySecondsBefore)) })}
                     />
-                    <span className="text-xs text-base-content/40">days</span>
+                    <select
+                      className="select select-xs bg-base-300/50 text-xs"
+                      value={delayUnits[idx] ?? defaultDelayUnit(ws.delaySecondsBefore)}
+                      onChange={(e) => setDelayUnits((previous) => ({ ...previous, [idx]: e.target.value as DelayUnit }))}
+                    >
+                      <option value="seconds">seconds</option>
+                      <option value="minutes">minutes</option>
+                      <option value="days">days</option>
+                    </select>
                   </div>
                 </div>
 
@@ -1847,6 +1961,42 @@ function Wizard({
                   <p className="text-sm text-base-content/50">
                     Visits the profile. They&apos;ll see you in &quot;Who viewed my profile&quot;. No further configuration needed.
                   </p>
+                )}
+
+                {ws.type === "wait_for_reply" && (
+                  <p className="text-sm text-base-content/50">
+                    Pauses this LinkedIn track until the prospect sends a new inbound reply. Other workflow types keep their existing stop-on-reply behavior.
+                  </p>
+                )}
+
+                {ws.type === "introduction_handoff" && (
+                  <div className="space-y-4">
+                    <p className="text-sm text-base-content/50">
+                      Sends the introducer&apos;s final direct message, creates the group with the selected main account, then sends both group messages. All fields support contact variables.
+                    </p>
+                    {([
+                      ["Pre-group direct message", "handoffPreGroupMessage", "Sent by the introducer before creating the group"],
+                      ["Group title", "handoffGroupTitle", "For example: Dreach <> {{first_name}}"],
+                      ["Introducer group message", "handoffIntroducerGroupMessage", "Sent by the introducer in the new group"],
+                      ["Main group message", "handoffMainGroupMessage", "Sent by the main account in the new group"],
+                    ] as const).map(([label, field, help]) => (
+                      <div key={field}>
+                        <label className="text-xs text-base-content/50 mb-1 block">{label}</label>
+                        <p className="text-[11px] text-base-content/30 mb-1.5">{help}</p>
+                        <div className="flex flex-wrap gap-1.5 mb-2">
+                          {VARIABLES.map((variable) => (
+                            <button key={variable} type="button" onClick={() => updateStep(idx, { [field]: ws[field] + variable })} className="px-2 py-0.5 rounded bg-base-300/60 text-xs text-base-content/50 hover:text-base-content hover:bg-base-300 transition-colors font-mono">{variable}</button>
+                          ))}
+                        </div>
+                        <textarea
+                          className="textarea textarea-bordered w-full bg-base-300/50 text-sm resize-none font-mono"
+                          rows={field === "handoffGroupTitle" ? 2 : 3}
+                          value={ws[field]}
+                          onChange={(e) => updateStep(idx, { [field]: e.target.value })}
+                        />
+                      </div>
+                    ))}
+                  </div>
                 )}
 
                 {ws.type === "connect" && (
@@ -3067,12 +3217,12 @@ export default function WorkflowDetailPage({
                   if (s.step_type === "delay") { prevDelay = s; continue; }
                   const sel = isStepSelected(s);
                   const delayStep = prevDelay;
-                  const delayDays = delayStep ? Math.round(delayStep.delay_seconds / 86400) : 0;
+                  const delaySeconds = delayStep?.delay_seconds ?? 0;
                   prevDelay = null;
 
                   rendered.push(
                     <div key={s.id} className="flex flex-col items-stretch">
-                      {delayDays > 0 ? (
+                      {delaySeconds > 0 ? (
                         <>
                           <div className="flex justify-center"><div className="w-px h-3 bg-base-content/20" /></div>
                           <button
@@ -3084,7 +3234,7 @@ export default function WorkflowDetailPage({
                             className={`w-full flex items-center gap-2 py-1 px-3 rounded-lg transition-colors ${typeof selectedStep === "object" && selectedStep !== null && selectedStep.track === track && selectedStep.step_order === delayStep?.step_order ? "bg-base-300/60 text-base-content/70" : "text-base-content/40 hover:text-base-content/70 hover:bg-base-200/60"}`}
                           >
                             <RiTimeLine size={11} className="shrink-0" />
-                            <span className="text-xs">Wait {delayDays}d</span>
+                            <span className="text-xs">{formatDelay(delaySeconds)}</span>
                           </button>
                           <div className="flex justify-center"><div className="w-px h-3 bg-base-content/20" /></div>
                         </>

@@ -5,6 +5,12 @@ import { visitProfile } from "@/lib/linkedin/visit";
 import { sendConnectionRequest, WeeklyLimitError, AlreadyConnectedError, PendingInviteError } from "@/lib/linkedin/connect";
 import { sendMessage, NotConnectedError } from "@/lib/linkedin/message";
 import { shouldSyncAccepted, syncAcceptedConnections } from "@/lib/linkedin/sync-accepted";
+import { shouldSyncLinkedInReplies, syncLinkedInReplies } from "@/lib/linkedin/reply-sync";
+import {
+  createLinkedInGroup,
+  resolveCurrentMemberUrn,
+  sendLinkedInConversationMessage,
+} from "@/lib/linkedin/group-chat";
 import { sendEmail } from "@/lib/email/sender";
 import { shouldSyncEmailInbox, syncEmailInbox } from "@/lib/email/inbox";
 import { enrichProfile } from "@/lib/linkedin/enrich";
@@ -123,7 +129,7 @@ interface WorkflowStep {
   id: string;
   step_order: number;
   track: "linkedin" | "email";
-  step_type: "visit" | "connect" | "message" | "sales_inmail" | "delay" | "email";
+  step_type: "visit" | "connect" | "message" | "sales_inmail" | "delay" | "email" | "wait_for_reply" | "introduction_handoff";
   template_id: string | null;
   delay_seconds: number;
   connect_note: string | null;
@@ -138,6 +144,7 @@ interface WorkflowStep {
   email_position: number | null;
   message_position: number | null;
   email_signature: string | null;
+  config_json: string | null;
 }
 
 // A track-run row joined with its parent run_profile and run context
@@ -159,6 +166,7 @@ interface TrackRun {
   target_id: string;
   email_account_id: string | null;
   account_id: string;
+  main_account_id: string | null;
   workflow_id: string;
   // joined from targets — lets the daily-limit gate tell a NEW connect send apart
   // from a free acceptance recheck on an already-sent request
@@ -183,6 +191,7 @@ interface Target {
   email_replied_at: string | null;
   company_id: string | null;
   messaging_urn: string | null;
+  linkedin_member_urn: string | null;
 }
 
 interface Template { id: string; body: string; }
@@ -210,11 +219,22 @@ function randomDelay(minSec: number, maxSec: number) { return sleep((minSec + Ma
 function nowIso() { return new Date().toISOString(); }
 function addHours(h: number) { return new Date(Date.now() + h * 3600_000).toISOString(); }
 function hoursSince(isoStr: string) { return (Date.now() - new Date(isoStr).getTime()) / 3600_000; }
+function storedTimestampMs(value: string): number {
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)
+    ? `${value.replace(" ", "T")}Z`
+    : value;
+  return Date.parse(normalized);
+}
 
 // ─── TrackRun verb layer ─────────────────────────────────────────────────────
 // These are the only functions that write to run_profile_tracks rows.
 
-function trAdvance(db: ReturnType<typeof getDb>, tr: TrackRun, steps: WorkflowStep[]) {
+function trAdvance(
+  db: ReturnType<typeof getDb>,
+  tr: TrackRun,
+  steps: WorkflowStep[],
+  delayAnchorAt?: string | null,
+) {
   const nextIndex = tr.current_step + 1;
   if (nextIndex >= steps.length) {
     db.prepare(
@@ -222,7 +242,12 @@ function trAdvance(db: ReturnType<typeof getDb>, tr: TrackRun, steps: WorkflowSt
     ).run(nextIndex, tr.id);
   } else {
     const nextStep = steps[nextIndex];
-    const nextAt = nextStep.delay_seconds > 0 ? new Date(Date.now() + nextStep.delay_seconds * 1000).toISOString() : null;
+    const anchorMs = delayAnchorAt ? storedTimestampMs(delayAnchorAt) : Number.NaN;
+    const nextAt = nextStep.delay_seconds > 0
+      ? new Date(Number.isFinite(anchorMs)
+          ? Math.max(Date.now(), anchorMs + nextStep.delay_seconds * 1000)
+          : Date.now() + nextStep.delay_seconds * 1000).toISOString()
+      : null;
     db.prepare(
       "UPDATE run_profile_tracks SET current_step = ?, last_step_at = datetime('now'), next_step_at = ? WHERE id = ?"
     ).run(nextIndex, nextAt, tr.id);
@@ -359,7 +384,7 @@ async function ensureSalesNavEnriched(db: ReturnType<typeof getDb>, target: Targ
   }
 }
 
-async function ensureApolloEnriched(db: ReturnType<typeof getDb>, target: Target, runId: string): Promise<void> {
+async function ensureApolloEnriched(db: ReturnType<typeof getDb>, target: Target): Promise<void> {
   const fresh = db.prepare("SELECT apollo_enriched_at, email, linkedin_url, sales_nav_url FROM targets WHERE id = ?").get(target.id) as { apollo_enriched_at: string | null; email: string | null; linkedin_url: string | null; sales_nav_url: string | null } | undefined;
   if (!fresh || fresh.apollo_enriched_at || fresh.email) return;
   const apolloUrl = fresh.linkedin_url?.includes("/in/") ? fresh.linkedin_url : fresh.sales_nav_url;
@@ -456,6 +481,194 @@ async function ensureApolloEnriched(db: ReturnType<typeof getDb>, target: Target
   }
 }
 
+interface IntroductionHandoffConfig {
+  preGroupMessage: string;
+  groupTitle: string;
+  introducerGroupMessage: string;
+  mainGroupMessage: string;
+}
+
+interface HandoffState {
+  conversation_urn: string | null;
+  pre_group_message_sent_at: string | null;
+  group_created_at: string | null;
+  introducer_group_message_sent_at: string | null;
+  main_group_message_sent_at: string | null;
+}
+
+interface LinkedInSenderAccount extends AccountLimits {
+  id: string;
+  is_authenticated: number;
+  linkedin_member_urn: string | null;
+}
+
+function handoffConfig(step: WorkflowStep): IntroductionHandoffConfig {
+  let config: Record<string, unknown> = {};
+  if (step.config_json) {
+    try { config = JSON.parse(step.config_json) as Record<string, unknown>; } catch { /* use defaults */ }
+  }
+  const stringValue = (key: string, fallback: string) =>
+    typeof config[key] === "string" && config[key].trim() ? config[key].trim() : fallback;
+  return {
+    preGroupMessage: stringValue("pre_group_message", "Hey, I'm creating a group chat with you and Dreach"),
+    groupTitle: stringValue("group_title", "Dreach <> {{first_name}}"),
+    introducerGroupMessage: stringValue("introducer_group_message", "Hey, Kabir is building in this space, you should connect"),
+    mainGroupMessage: stringValue("main_group_message", "Hey {{first_name}}, how are you doing?"),
+  };
+}
+
+function handoffMessagesSentToday(
+  db: ReturnType<typeof getDb>,
+  accountId: string,
+  role: "introducer" | "main",
+): number {
+  if (role === "main") {
+    return (db.prepare(`
+      SELECT COUNT(*) AS c
+      FROM linkedin_handoffs h
+      JOIN run_profiles rp ON rp.id = h.run_profile_id
+      JOIN runs r ON r.id = rp.run_id
+      WHERE r.main_account_id = ?
+        AND h.main_group_message_sent_at IS NOT NULL
+        AND date(h.main_group_message_sent_at) = date('now')
+    `).get(accountId) as { c: number }).c;
+  }
+  return (db.prepare(`
+    SELECT
+      SUM(CASE WHEN h.pre_group_message_sent_at IS NOT NULL
+                    AND date(h.pre_group_message_sent_at) = date('now') THEN 1 ELSE 0 END) +
+      SUM(CASE WHEN h.introducer_group_message_sent_at IS NOT NULL
+                    AND date(h.introducer_group_message_sent_at) = date('now') THEN 1 ELSE 0 END) AS c
+    FROM linkedin_handoffs h
+    JOIN run_profiles rp ON rp.id = h.run_profile_id
+    JOIN runs r ON r.id = rp.run_id
+    WHERE r.account_id = ?
+  `).get(accountId) as { c: number | null }).c ?? 0;
+}
+
+function ordinaryMessagesSentToday(db: ReturnType<typeof getDb>, accountId: string): number {
+  return (db.prepare(`
+    SELECT COUNT(*) AS c FROM logs
+    WHERE run_id IN (SELECT id FROM runs WHERE account_id = ?)
+      AND message LIKE 'Message sent%'
+      AND date(created_at) = date('now')
+  `).get(accountId) as { c: number }).c;
+}
+
+function maySendHandoffMessage(
+  db: ReturnType<typeof getDb>,
+  tr: TrackRun,
+  runId: string,
+  target: Target,
+  account: LinkedInSenderAccount,
+  role: "introducer" | "main",
+): boolean {
+  const senderName = role === "main" ? "main-account handoff message" : "introducer handoff message";
+  if (!account.is_authenticated) throw new Error(`The ${role} LinkedIn account needs to be re-authenticated`);
+  if (!enforceSchedule(db, tr, runId, target.id, senderName, account)) return false;
+  const sentToday = handoffMessagesSentToday(db, account.id, role)
+    + (role === "introducer" ? ordinaryMessagesSentToday(db, account.id) : 0);
+  if (sentToday >= (account.daily_message_limit ?? 50)) {
+    const nextSlot = rescheduleToTomorrow(account);
+    log(db, runId, target.id, "info", `Daily message limit reached for ${role} account — rescheduled to ${nextSlot}`);
+    trReschedule(db, tr, nextSlot);
+    return false;
+  }
+  return true;
+}
+
+async function executeIntroductionHandoff(
+  db: ReturnType<typeof getDb>,
+  runId: string,
+  tr: TrackRun,
+  target: Target,
+  step: WorkflowStep,
+  steps: WorkflowStep[],
+  introducer: LinkedInSenderAccount,
+): Promise<void> {
+  if (!tr.main_account_id) throw new Error("Introduction handoff has no main LinkedIn account");
+  const main = db.prepare(`
+    SELECT id, is_authenticated, linkedin_member_urn,
+           daily_connection_limit, daily_message_limit, daily_inmail_limit,
+           active_hours_start, active_hours_end, timezone, working_days
+    FROM accounts WHERE id = ?
+  `).get(tr.main_account_id) as LinkedInSenderAccount | undefined;
+  if (!main) throw new Error("The main LinkedIn account no longer exists");
+
+  db.prepare("INSERT OR IGNORE INTO linkedin_handoffs (run_profile_id) VALUES (?)").run(tr.run_profile_id);
+  const getState = () => db.prepare("SELECT * FROM linkedin_handoffs WHERE run_profile_id = ?")
+    .get(tr.run_profile_id) as HandoffState;
+  let state = getState();
+  const config = handoffConfig(step);
+  const name = target.full_name ?? target.linkedin_url;
+
+  if (!state.pre_group_message_sent_at) {
+    if (!maySendHandoffMessage(db, tr, runId, target, introducer, "introducer")) return;
+    const freshTarget = db.prepare("SELECT * FROM targets WHERE id = ?").get(target.id) as Target;
+    if (!freshTarget.full_name) throw new Error(`Target ${target.id} has no full name for the handoff message`);
+    const linkedinUrl = await getLinkedinUrl(db, freshTarget, introducer.id);
+    const text = renderTemplate(config.preGroupMessage, freshTarget);
+    const page = await getSessionPage(introducer.id);
+    try {
+      const result = await sendMessage(page, freshTarget.full_name, text, linkedinUrl, freshTarget.messaging_urn);
+      if (result.messagingUrn) {
+        db.prepare("UPDATE targets SET messaging_urn = COALESCE(messaging_urn, ?), linkedin_member_urn = COALESCE(linkedin_member_urn, ?) WHERE id = ?")
+          .run(result.messagingUrn, result.messagingUrn, target.id);
+      }
+    } finally {
+      await page.close();
+    }
+    await saveSessionState(introducer.id);
+    db.prepare(`UPDATE linkedin_handoffs
+      SET pre_group_message_sent_at = ?, last_error = NULL, updated_at = datetime('now')
+      WHERE run_profile_id = ?`).run(nowIso(), tr.run_profile_id);
+    log(db, runId, target.id, "info", `Pre-group message sent to ${name}`);
+    state = getState();
+  }
+
+  if (!main.linkedin_member_urn) {
+    if (!main.is_authenticated) throw new Error("The main LinkedIn account needs to be re-authenticated");
+    main.linkedin_member_urn = await resolveCurrentMemberUrn(main.id);
+    db.prepare("UPDATE accounts SET linkedin_member_urn = ? WHERE id = ?").run(main.linkedin_member_urn, main.id);
+  }
+
+  if (!state.conversation_urn) {
+    if (!maySendHandoffMessage(db, tr, runId, target, introducer, "introducer")) return;
+    const freshTarget = db.prepare("SELECT * FROM targets WHERE id = ?").get(target.id) as Target;
+    const prospectUrn = freshTarget.linkedin_member_urn ?? freshTarget.messaging_urn;
+    if (!prospectUrn) throw new Error(`No LinkedIn member URN is available for ${name}`);
+    const initialMessage = renderTemplate(config.introducerGroupMessage, freshTarget);
+    const result = await createLinkedInGroup(introducer.id, {
+      participantUrns: [prospectUrn, main.linkedin_member_urn],
+      title: renderTemplate(config.groupTitle, freshTarget),
+      initialMessage,
+    });
+    const createdAt = nowIso();
+    db.prepare(`UPDATE linkedin_handoffs
+      SET conversation_urn = ?, group_created_at = ?, introducer_group_message_sent_at = ?,
+          last_error = NULL, updated_at = datetime('now')
+      WHERE run_profile_id = ?`).run(result.conversationUrn, createdAt, createdAt, tr.run_profile_id);
+    log(db, runId, target.id, "info", `Created LinkedIn group for ${name} and sent the introducer message`);
+    state = getState();
+  }
+
+  if (!state.main_group_message_sent_at) {
+    if (!maySendHandoffMessage(db, tr, runId, target, main, "main")) return;
+    if (!state.conversation_urn) throw new Error("LinkedIn group conversation URN was not persisted");
+    await sendLinkedInConversationMessage(
+      main.id,
+      state.conversation_urn,
+      renderTemplate(config.mainGroupMessage, target),
+    );
+    db.prepare(`UPDATE linkedin_handoffs
+      SET main_group_message_sent_at = ?, last_error = NULL, updated_at = datetime('now')
+      WHERE run_profile_id = ?`).run(nowIso(), tr.run_profile_id);
+    log(db, runId, target.id, "info", `Main account replied in the LinkedIn group for ${name}`);
+  }
+
+  trAdvance(db, tr, steps);
+}
+
 // ─── step execution ──────────────────────────────────────────────────────────
 
 async function executeStep(
@@ -476,9 +689,27 @@ async function executeStep(
     return;
   }
 
-  // Auto-unenroll if lead has replied on either channel — mark ALL track-runs for this profile skipped
+  const step = steps[stepIndex];
+  const name = target.full_name ?? target.linkedin_url;
+
   const replyCheck = db.prepare("SELECT last_replied_at, email_replied_at FROM targets WHERE id = ?").get(target.id) as { last_replied_at: string | null; email_replied_at: string | null };
-  if (replyCheck?.last_replied_at || replyCheck?.email_replied_at) {
+  if (step.step_type === "wait_for_reply") {
+    if (replyCheck?.last_replied_at) {
+      log(db, runId, target.id, "info", `${name} replied via LinkedIn — continuing introduction workflow`);
+      trAdvance(db, tr, steps);
+    } else {
+      // The inbox synchronizer wakes this track immediately when it finds a reply.
+      // A long fallback prevents this passive gate from creating noisy runner work.
+      trWait(db, tr, 24);
+    }
+    return;
+  }
+
+  // Auto-unenroll if lead has replied on either channel — mark ALL track-runs for this profile skipped
+  // unless this LinkedIn track has explicitly passed a wait-for-reply gate.
+  const passedReplyGate = tr.track === "linkedin"
+    && steps.slice(0, stepIndex).some(candidate => candidate.step_type === "wait_for_reply");
+  if ((replyCheck?.last_replied_at || replyCheck?.email_replied_at) && !passedReplyGate) {
     const channel = replyCheck.email_replied_at ? "email" : "LinkedIn";
     log(db, runId, target.id, "info", `${target.full_name ?? target.linkedin_url} replied via ${channel} — unenrolling from workflow`);
     db.prepare(
@@ -486,9 +717,6 @@ async function executeStep(
     ).run(tr.run_profile_id);
     return;
   }
-
-  const step = steps[stepIndex];
-  const name = target.full_name ?? target.linkedin_url;
 
   try {
     if (step.step_type === "delay") {
@@ -520,9 +748,10 @@ async function executeStep(
 
       const freshTarget = db.prepare("SELECT * FROM targets WHERE id = ?").get(target.id) as Target;
       if (freshTarget.degree === 1) {
-        if (!freshTarget.connected_at) db.prepare("UPDATE targets SET connected_at = ? WHERE id = ?").run(nowIso(), target.id);
+        const connectedAt = freshTarget.connected_at ?? nowIso();
+        if (!freshTarget.connected_at) db.prepare("UPDATE targets SET connected_at = ? WHERE id = ?").run(connectedAt, target.id);
         log(db, runId, target.id, "info", `${name} already connected — skipping connect step`);
-        trAdvance(db, tr, steps);
+        trAdvance(db, tr, steps, connectedAt);
         return;
       }
 
@@ -657,6 +886,31 @@ async function executeStep(
       trAdvance(db, tr, steps);
       log(db, runId, target.id, "info", `Message sent to ${name}`);
 
+    } else if (step.step_type === "introduction_handoff") {
+      try {
+        await executeIntroductionHandoff(
+          db,
+          runId,
+          tr,
+          target,
+          step,
+          steps,
+          { ...accountLimits, id: accountId, is_authenticated: 1, linkedin_member_urn: null },
+        );
+      } catch (handoffError) {
+        const message = handoffError instanceof Error ? handoffError.message : String(handoffError);
+        db.prepare(`UPDATE linkedin_handoffs
+          SET last_error = ?, updated_at = datetime('now')
+          WHERE run_profile_id = ?`).run(message, tr.run_profile_id);
+        if (message.includes("created the group but did not return a conversation URN")) {
+          trFail(db, tr, message);
+          log(db, runId, target.id, "error", `Introduction handoff stopped to avoid creating a duplicate group: ${message}`);
+          return;
+        }
+        trWait(db, tr, 0.25);
+        log(db, runId, target.id, "error", `Introduction handoff paused and will retry: ${message}`);
+      }
+
     } else if (step.step_type === "sales_inmail") {
       // Sales Navigator InMail — reaches NON-connections (no degree gate), needs a
       // subject + body, costs one InMail credit. Body config mirrors the message
@@ -761,7 +1015,7 @@ async function executeStep(
       log(db, runId, target.id, "info", `InMail sent to ${name}`);
 
     } else if (step.step_type === "email") {
-      await ensureApolloEnriched(db, target, runId);
+      await ensureApolloEnriched(db, target);
 
       if (!emailAccountId || !emailAccountLimits) {
         log(db, runId, target.id, "warn", `Email step skipped — no email account configured on this run`);
@@ -1000,14 +1254,14 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
     }
   }
 
-  // LinkedIn inbox reply detection (messaging GraphQL) — once per 15min per
-  // account. Sets targets.last_replied_at so the runner auto-unenrolls repliers.
-  // LinkedIn reply detection is a premium feature (AI classifier layer) — no-op without ee/.
+  // LinkedIn inbox reply detection uses the authenticated browser session and
+  // private Voyager transport. It stamps targets.last_replied_at and wakes any
+  // wait-for-reply track immediately; cadence defaults to 60s and is configurable.
   for (const accountId of seenAccounts) {
-    if (premium?.replies?.shouldSyncInbox(accountId)) {
+    if (shouldSyncLinkedInReplies(accountId)) {
       try {
         console.log(`[runner] Starting LinkedIn inbox sync for account ${accountId}`);
-        const replies = await premium.replies.syncAccountInbox(accountId);
+        const replies = await syncLinkedInReplies(accountId);
         console.log(`[runner] LinkedIn inbox sync complete — ${replies} new repl${replies === 1 ? "y" : "ies"}`);
         if (replies > 0) {
           for (const r of activeRuns.filter(x => x.account_id === accountId)) {
@@ -1173,7 +1427,7 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
             rt.error_message, rt.last_email_subject, rt.last_email_body, rt.last_linkedin_message,
             rt.pending_reply_context,
             rp.run_id, rp.target_id, rp.email_account_id,
-            r.account_id, r.workflow_id,
+            r.account_id, r.main_account_id, r.workflow_id,
             t.connection_requested_at
      FROM run_profile_tracks rt
      JOIN run_profiles rp ON rp.id = rt.run_profile_id
@@ -1403,6 +1657,12 @@ function spreadEnrollBatch(
     if (claimed.changes === 0) continue;
     const slot = (() => {
       if (nowFrac >= end - 0.25) return rescheduleToTomorrow(limits);
+      // Starting a run should produce observable work promptly. Keep the rest
+      // of a batch spread across the active window, but make its first profile
+      // due now when the sender is already inside that window. Previously a
+      // one-profile run was randomized across the entire day (and could wait
+      // for hours), which made an otherwise autonomous workflow look stalled.
+      if (i === 0 && isWithinSchedule(limits)) return new Date().toISOString();
       const bucketStart = dayStartMs + i * bucketMs;
       const bucketEnd = bucketStart + bucketMs;
       return new Date(bucketStart + Math.random() * (bucketEnd - bucketStart)).toISOString();
