@@ -20,6 +20,8 @@ type Tab = "linkedin" | "email" | "templates" | "integrations" | "general";
 
 interface LiAccount {
   id: string; name: string; email: string;
+  role: "introducer" | "main" | null;
+  linkedin_member_urn: string | null;
   is_authenticated: number;
   daily_connection_limit: number; daily_message_limit: number; daily_inmail_limit: number;
   active_hours_start: number; active_hours_end: number;
@@ -51,8 +53,8 @@ export const getServerSideProps: GetServerSideProps = async ({ query }) => {
   const liAccounts = db
     .prepare(
       `SELECT a.id, a.name, a.email, a.is_authenticated, a.daily_connection_limit, a.daily_message_limit, a.daily_inmail_limit,
-              a.active_hours_start, a.active_hours_end, a.timezone, a.working_days, a.created_at,
-              (SELECT COUNT(*) FROM runs r WHERE r.account_id = a.id AND r.status IN ('running', 'paused')) AS active_run_count
+              a.active_hours_start, a.active_hours_end, a.timezone, a.working_days, a.created_at, a.role, a.linkedin_member_urn,
+              (SELECT COUNT(*) FROM runs r WHERE (r.account_id = a.id OR r.main_account_id = a.id) AND r.status IN ('running', 'paused')) AS active_run_count
        FROM accounts a ORDER BY a.created_at DESC`
     )
     .all();
@@ -219,7 +221,7 @@ export default function SettingsPage({
 // ─── LinkedIn Tab ─────────────────────────────────────────────────────────────
 
 const BLANK_LI_FORM = {
-  name: "", email: "",
+  name: "", email: "", role: "", linkedin_member_urn: "",
   daily_connection_limit: 20, daily_message_limit: 50, daily_inmail_limit: 15,
   active_hours_start: 9, active_hours_end: 18,
   timezone: "Europe/Berlin", working_days: "1,2,3,4,5",
@@ -310,6 +312,8 @@ function LinkedInTab({ initialAccounts }: { initialAccounts: LiAccount[] }) {
     setEditingAccount(a);
     setForm({
       name: a.name, email: a.email,
+      role: a.role ?? "",
+      linkedin_member_urn: a.linkedin_member_urn ?? "",
       daily_connection_limit: a.daily_connection_limit,
       daily_message_limit: a.daily_message_limit,
       daily_inmail_limit: a.daily_inmail_limit,
@@ -396,6 +400,11 @@ function LinkedInTab({ initialAccounts }: { initialAccounts: LiAccount[] }) {
                   {a.email} · {a.daily_connection_limit} conn/day · {a.daily_message_limit} msg/day · {a.daily_inmail_limit} inmail/day
                   {" · "}{fmtHour(a.active_hours_start ?? 9)}–{fmtHour(a.active_hours_end ?? 18)} ({a.timezone ?? "UTC"})
                 </p>
+                {a.role ? (
+                  <span className={`inline-flex mt-1 px-2 py-0.5 rounded-md text-xs font-medium ${a.role === "introducer" ? "bg-info/15 text-info" : "bg-secondary/15 text-secondary"}`}>
+                    {a.role === "introducer" ? "Introducer" : "Main participant"}
+                  </span>
+                ) : null}
               </div>
               <div className="flex items-center gap-2 shrink-0">
                 {a.active_run_count > 0 ? (
@@ -445,6 +454,22 @@ function LinkedInTab({ initialAccounts }: { initialAccounts: LiAccount[] }) {
               <div>
                 <label className="label text-xs text-base-content/50 pb-1">Email</label>
                 <input type="email" className="input input-bordered input-sm w-full bg-base-300/50" placeholder="you@example.com" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} required />
+              </div>
+              <div className="border-t border-base-300/40 pt-3 flex flex-col gap-3">
+                <div>
+                  <label className="label text-xs text-base-content/50 pb-1">Introduction handoff role</label>
+                  <select className="select select-sm w-full" value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}>
+                    <option value="">No handoff role</option>
+                    <option value="introducer">Introducer — starts the conversation</option>
+                    <option value="main">Main — joins the group conversation</option>
+                  </select>
+                  <p className="mt-1 text-xs text-base-content/40">Each role can be assigned to only one account.</p>
+                </div>
+                <div>
+                  <label className="label text-xs text-base-content/50 pb-1">LinkedIn member URN (optional)</label>
+                  <input className="input input-bordered input-sm w-full bg-base-300/50 font-mono text-xs" placeholder="Resolved automatically after authentication" value={form.linkedin_member_urn} onChange={(e) => setForm({ ...form, linkedin_member_urn: e.target.value })} />
+                  <p className="mt-1 text-xs text-base-content/40">Usually leave this blank; the handoff resolves and stores it from the authenticated session.</p>
+                </div>
               </div>
               <div className="grid grid-cols-3 gap-3">
                 <div>

@@ -116,23 +116,39 @@ function resultNameMatches(resultText: string, fullName: string): boolean {
 }
 
 async function sendFromComposeBox(page: Page, text: string): Promise<void> {
-  // Paste message into compose area
+  // Use Playwright's contenteditable-aware fill so LinkedIn receives a real
+  // input event and enables the Send button. Clipboard paste is unreliable on
+  // macOS because Control+V is not the paste shortcut, and a successful
+  // clipboard write followed by that no-op left the composer empty.
   const msgInput = page.locator("div.msg-form__contenteditable").first();
   await msgInput.waitFor({ timeout: 8000 });
   await msgInput.click();
   try {
-    await page.evaluate((t) => navigator.clipboard.writeText(t), text);
-    await page.waitForTimeout(300);
-    await msgInput.press("Control+V");
+    await msgInput.fill(text);
   } catch {
-    // Clipboard blocked in headless — fall back to keyboard typing
+    const selectAll = process.platform === "darwin" ? "Meta+A" : "Control+A";
+    await msgInput.press(selectAll);
+    await msgInput.press("Backspace");
     await msgInput.pressSequentially(text, { delay: 20 });
   }
   await page.waitForTimeout(500);
 
+  const composed = (await msgInput.innerText().catch(() => "")).trim();
+  if (!composed) {
+    throw new Error("LinkedIn message composer remained empty — refusing to click Send");
+  }
+
   // Send
   const sendBtn = page.locator("button.msg-form__send-button:visible").first();
   await sendBtn.waitFor({ timeout: 5000 });
+  await page.waitForFunction(
+    () => {
+      const button = document.querySelector<HTMLButtonElement>("button.msg-form__send-button:not([disabled])");
+      return Boolean(button);
+    },
+    undefined,
+    { timeout: 5000 }
+  );
   await sendBtn.click({ delay: 100 });
   await page.waitForTimeout(2000);
 }

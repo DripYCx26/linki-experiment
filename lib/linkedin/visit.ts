@@ -6,43 +6,28 @@ import type { Page } from "playwright";
  * lets the runner backfill degree=1 for contacts that were already connected
  * before Linki ever sent them a connection request (e.g. manually added leads).
  *
- * Primary-degree signal: presence of the profile's primary "Message" link
- * (a[href*="/messaging/compose"]) — only shown to 1st-degree connections, reads
- * an href attribute rather than a CSS class or translated text, so it survives
- * both LinkedIn's periodic class-name hashing and non-English UI languages.
- *
- * MUST be scoped to the visited person's own intro/top card — a page-wide
- * search also matches "Message" links belonging to OTHER people rendered
- * elsewhere on the page (sidebar modules like "People also viewed" / suggested
- * connections). For a non-connected target, THEIR page has no such link, but
- * the sidebar still does — a page-wide `.first()` silently grabbed a random
- * unrelated 1st-degree connection's link, wrongly marked the target degree=1,
- * and stored that stranger's messaging URN, causing messages to go to the
- * wrong person entirely (incident: Jul 2026, see CLAUDE.md/memory). The top
- * card is identified structurally as the section containing the page's own
- * <h1> name heading, which is robust to LinkedIn's class-name hashing.
- *
- * Falls back to the old text-scrape (/\b1st\b/ within that same top card)
- * when the link isn't found, in case the current account's profile layout
- * doesn't render it as a plain link (e.g. buried behind a click/menu).
- *
- * The same link's href carries the messaging URN (urn:li:fsd_profile:ACoAA...)
- * needed to message this person directly later without a name-search typeahead
- * — see lib/linkedin/message.ts. Returned as messagingUrn when found.
+ * The target header's explicit "1st" badge is the degree signal. LinkedIn open
+ * profiles can expose Message to 2nd/3rd-degree viewers, so Message alone is
+ * not proof of a connection. The target-specific Message href is still useful:
+ * it carries the profile URN needed for safe direct messaging after acceptance.
  */
 export async function visitProfile(page: Page, linkedinUrl: string): Promise<{ isFirstDegree: boolean; messagingUrn: string | null }> {
   await page.goto(linkedinUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
   await page.waitForTimeout(3000 + Math.random() * 2000);
 
-  const topCard = page.locator("main section").filter({ has: page.locator("h1") }).first();
-
-  const messageLink = topCard.locator('a[href*="/messaging/compose"]').first();
+  // Current LinkedIn SDUI pages no longer render the profile name as an h1.
+  // The target's primary Message action is the non-labelled compose link; the
+  // recommendation links below it carry person-specific aria-labels.
+  const messageLink = page.locator(
+    'main a[href*="/messaging/compose"][href*="screenContext=NON_SELF_PROFILE_VIEW"]:not([aria-label]):visible'
+  ).first();
   const messageHref = (await messageLink.count()) > 0 ? await messageLink.getAttribute("href").catch(() => null) : null;
   const urnMatch = messageHref?.match(/profileUrn=([^&]+)/);
   const messagingUrn = urnMatch ? decodeURIComponent(urnMatch[1]) : null;
 
-  if (messageHref) return { isFirstDegree: true, messagingUrn };
-
-  const pageText = await topCard.innerText().catch(() => "");
-  return { isFirstDegree: /\b1st\b/.test(pageText), messagingUrn: null };
+  // Open-profile members can expose Message while still being 2nd/3rd degree.
+  // Only the target header's explicit degree badge proves first-degree status.
+  const mainText = await page.locator("main").innerText().catch(() => "");
+  const profileHeaderText = mainText.split(/\bActivity\b/i, 1)[0] ?? "";
+  return { isFirstDegree: /\b1st\b/.test(profileHeaderText), messagingUrn };
 }

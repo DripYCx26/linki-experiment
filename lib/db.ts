@@ -472,6 +472,30 @@ function runMigrations(db: Database.Database) {
     "ALTER TABLE lists ADD COLUMN purpose TEXT",
     // Manual/CSV-only field — no automation reads or writes this, reference data only.
     "ALTER TABLE targets ADD COLUMN phone TEXT",
+    // LinkedIn introduction handoff: the account that starts the conversation can
+    // be configured separately from the account that joins the group conversation.
+    // Roles are optional so existing installations and ordinary campaigns retain
+    // their current behavior.
+    "ALTER TABLE accounts ADD COLUMN role TEXT CHECK(role IN ('introducer', 'main'))",
+    "ALTER TABLE accounts ADD COLUMN linkedin_member_urn TEXT",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_unique_non_null_role ON accounts(role) WHERE role IS NOT NULL",
+    "ALTER TABLE runs ADD COLUMN main_account_id TEXT REFERENCES accounts(id)",
+    // Handoff-specific templates/configuration (for example, group title and the
+    // three messages) live on the handoff workflow step. Existing message_body is
+    // intentionally left alone for ordinary message steps.
+    "ALTER TABLE workflow_steps ADD COLUMN config_json TEXT",
+    `CREATE TABLE IF NOT EXISTS linkedin_handoffs (
+      run_profile_id TEXT PRIMARY KEY REFERENCES run_profiles(id) ON DELETE CASCADE,
+      conversation_urn TEXT,
+      pre_group_message_sent_at TEXT,
+      group_created_at TEXT,
+      introducer_group_message_sent_at TEXT,
+      main_group_message_sent_at TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`,
+    "CREATE INDEX IF NOT EXISTS idx_linkedin_handoffs_conversation_urn ON linkedin_handoffs(conversation_urn)",
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }
@@ -482,54 +506,29 @@ function runMigrations(db: Database.Database) {
   // Drop deprecated run_profiles columns (state, current_step, etc.) — consumers now read track-runs
   dropDeprecatedRunProfileColumns(db);
 
-  // Migrate workflow_steps CHECK constraint to allow 'delay' and 'email' step_types
+  // Migrate legacy workflow_steps CHECK constraints without discarding columns that
+  // were added after the original schema. Some long-lived installations can still
+  // have the pre-email constraint, so preserve every known step field and its data.
   try {
     const tableInfo = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='workflow_steps'").get() as { sql: string } | undefined;
     if (tableInfo && (!tableInfo.sql.includes("'delay'") || !tableInfo.sql.includes("'email'"))) {
+      const existingCols = new Set(
+        (db.prepare("PRAGMA table_info(workflow_steps)").all() as Array<{ name: string }>).map((column) => column.name)
+      );
+      const finalCols = [
+        "id", "workflow_id", "step_order", "step_type", "template_id", "delay_seconds",
+        "connect_note", "message_body", "email_subject", "email_body", "enabled", "ai_enabled",
+        "ai_model", "ai_prompt", "ai_max_words", "email_position", "message_position",
+        "ai_language", "track", "email_signature", "config_json",
+      ];
+      const copyCols = finalCols.filter((column) => existingCols.has(column));
       db.exec(`
         PRAGMA foreign_keys = OFF;
         CREATE TABLE workflow_steps_new (
           id TEXT PRIMARY KEY,
           workflow_id TEXT REFERENCES workflows(id) ON DELETE CASCADE,
           step_order INTEGER NOT NULL,
-          step_type TEXT NOT NULL CHECK(step_type IN ('visit', 'connect', 'message', 'delay', 'email')),
-          template_id TEXT REFERENCES templates(id),
-          delay_seconds INTEGER DEFAULT 0,
-          connect_note TEXT,
-          message_body TEXT,
-          email_subject TEXT,
-          email_body TEXT,
-          enabled INTEGER DEFAULT 1
-        );
-        INSERT INTO workflow_steps_new
-          SELECT id, workflow_id, step_order, step_type, template_id, delay_seconds,
-                 connect_note, message_body,
-                 NULL, NULL,
-                 enabled
-          FROM workflow_steps;
-        DROP TABLE workflow_steps;
-        ALTER TABLE workflow_steps_new RENAME TO workflow_steps;
-        PRAGMA foreign_keys = ON;
-      `);
-    }
-  } catch { /* migration already done */ }
-
-  // Allow the 'sales_inmail' step_type (Sales Navigator InMail). Rebuilds the
-  // table preserving EVERY current column (the historical rebuild above only
-  // copied the original columns — do NOT reuse it). InMail reuses message_body
-  // for the body and email_subject for the required subject.
-  try {
-    const ti = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='workflow_steps'").get() as { sql: string } | undefined;
-    if (ti && !ti.sql.includes("'sales_inmail'")) {
-      const cols = (db.prepare("PRAGMA table_info(workflow_steps)").all() as Array<{ name: string }>).map((c) => c.name);
-      const colList = cols.join(", ");
-      db.exec(`
-        PRAGMA foreign_keys = OFF;
-        CREATE TABLE workflow_steps_new (
-          id TEXT PRIMARY KEY,
-          workflow_id TEXT REFERENCES workflows(id) ON DELETE CASCADE,
-          step_order INTEGER NOT NULL,
-          step_type TEXT NOT NULL CHECK(step_type IN ('visit', 'connect', 'message', 'sales_inmail', 'delay', 'email')),
+          step_type TEXT NOT NULL CHECK(step_type IN ('visit', 'connect', 'message', 'sales_inmail', 'delay', 'email', 'wait_for_reply', 'introduction_handoff')),
           template_id TEXT REFERENCES templates(id),
           delay_seconds INTEGER DEFAULT 0,
           connect_note TEXT,
@@ -545,7 +544,52 @@ function runMigrations(db: Database.Database) {
           message_position INTEGER DEFAULT 1,
           ai_language TEXT DEFAULT 'English',
           track TEXT NOT NULL DEFAULT 'linkedin' CHECK(track IN ('linkedin', 'email')),
-          email_signature TEXT
+          email_signature TEXT,
+          config_json TEXT
+        );
+        INSERT INTO workflow_steps_new (${copyCols.join(", ")})
+          SELECT ${copyCols.join(", ")} FROM workflow_steps;
+        DROP TABLE workflow_steps;
+        ALTER TABLE workflow_steps_new RENAME TO workflow_steps;
+        PRAGMA foreign_keys = ON;
+      `);
+    }
+  } catch { /* migration already done */ }
+
+  // Allow the later LinkedIn operation types. Rebuild the table while preserving
+  // every current column (the historical rebuild above only copied the original
+  // columns, so it is not safe to reuse). The config_json field is reserved for
+  // operation-specific configuration such as introduction-handoff templates.
+  try {
+    const ti = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='workflow_steps'").get() as { sql: string } | undefined;
+    const requiredStepTypes = ["'sales_inmail'", "'wait_for_reply'", "'introduction_handoff'"];
+    if (ti && requiredStepTypes.some((stepType) => !ti.sql.includes(stepType))) {
+      const cols = (db.prepare("PRAGMA table_info(workflow_steps)").all() as Array<{ name: string }>).map((c) => c.name);
+      const colList = cols.join(", ");
+      db.exec(`
+        PRAGMA foreign_keys = OFF;
+        CREATE TABLE workflow_steps_new (
+          id TEXT PRIMARY KEY,
+          workflow_id TEXT REFERENCES workflows(id) ON DELETE CASCADE,
+          step_order INTEGER NOT NULL,
+          step_type TEXT NOT NULL CHECK(step_type IN ('visit', 'connect', 'message', 'sales_inmail', 'delay', 'email', 'wait_for_reply', 'introduction_handoff')),
+          template_id TEXT REFERENCES templates(id),
+          delay_seconds INTEGER DEFAULT 0,
+          connect_note TEXT,
+          message_body TEXT,
+          email_subject TEXT,
+          email_body TEXT,
+          enabled INTEGER DEFAULT 1,
+          ai_enabled INTEGER DEFAULT 0,
+          ai_model TEXT,
+          ai_prompt TEXT,
+          ai_max_words INTEGER,
+          email_position INTEGER DEFAULT 1,
+          message_position INTEGER DEFAULT 1,
+          ai_language TEXT DEFAULT 'English',
+          track TEXT NOT NULL DEFAULT 'linkedin' CHECK(track IN ('linkedin', 'email')),
+          email_signature TEXT,
+          config_json TEXT
         );
         INSERT INTO workflow_steps_new (${colList}) SELECT ${colList} FROM workflow_steps;
         DROP TABLE workflow_steps;
@@ -669,6 +713,8 @@ function initDb(db: Database.Database) {
       daily_connection_limit INTEGER DEFAULT 20,
       daily_message_limit INTEGER DEFAULT 50,
       daily_inmail_limit INTEGER DEFAULT 15,
+      role TEXT CHECK(role IN ('introducer', 'main')),
+      linkedin_member_urn TEXT,
       active_hours_start INTEGER DEFAULT 9,
       active_hours_end INTEGER DEFAULT 18,
       timezone TEXT DEFAULT 'UTC',
@@ -730,11 +776,12 @@ function initDb(db: Database.Database) {
       id TEXT PRIMARY KEY,
       workflow_id TEXT REFERENCES workflows(id) ON DELETE CASCADE,
       step_order INTEGER NOT NULL,
-      step_type TEXT NOT NULL CHECK(step_type IN ('visit', 'connect', 'message', 'delay')),
+      step_type TEXT NOT NULL CHECK(step_type IN ('visit', 'connect', 'message', 'sales_inmail', 'delay', 'email', 'wait_for_reply', 'introduction_handoff')),
       template_id TEXT REFERENCES templates(id),
       delay_seconds INTEGER DEFAULT 0,
       connect_note TEXT,
       message_body TEXT,
+      config_json TEXT,
       enabled INTEGER DEFAULT 1
     );
 
@@ -749,6 +796,7 @@ function initDb(db: Database.Database) {
       workflow_id TEXT REFERENCES workflows(id),
       list_id TEXT REFERENCES lists(id),
       account_id TEXT REFERENCES accounts(id),
+      main_account_id TEXT REFERENCES accounts(id),
       status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'paused', 'completed', 'failed')),
       created_at TEXT DEFAULT (datetime('now')),
       started_at TEXT,
@@ -767,6 +815,18 @@ function initDb(db: Database.Database) {
       error_message TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       UNIQUE(run_id, target_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS linkedin_handoffs (
+      run_profile_id TEXT PRIMARY KEY REFERENCES run_profiles(id) ON DELETE CASCADE,
+      conversation_urn TEXT,
+      pre_group_message_sent_at TEXT,
+      group_created_at TEXT,
+      introducer_group_message_sent_at TEXT,
+      main_group_message_sent_at TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS logs (

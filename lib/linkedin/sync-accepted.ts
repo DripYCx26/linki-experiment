@@ -36,19 +36,64 @@ import { getSessionPage, saveSessionState, markNeedsReauth } from "@/lib/linkedi
  *  - Reuses the runner's shared browser (getSessionPage) — never a 2nd browser.
  */
 
-const ACCEPTED_SYNC_INTERVAL_MS = 8 * 60 * 60 * 1000; // 8h — 3x per day
+const DEFAULT_ACCEPTED_SYNC_INTERVAL_SECONDS = 90;
+const ACCEPTED_SYNC_JITTER_MS = 8_000;
 const PAGE_SIZE = 100;
 const MAX_PAGES = 60; // safety cap (60 * 100 = 6000)
 const OVERLAP_MARGIN_MS = 24 * 60 * 60 * 1000; // re-check a day of overlap (idempotent)
 const DECORATION = "com.linkedin.voyager.dash.deco.web.mynetwork.ConnectionListWithProfile-16";
 
+// The runner may invoke this once per account on each tick. Keep the lock in
+// process rather than in SQLite: it protects concurrent ticks without leaving
+// a stale lock behind after a crash.
+const syncingAccounts = new Set<string>();
+
+function acceptedSyncIntervalMs(): number {
+  const configured = Number(process.env.LINKEDIN_ACCEPTANCE_POLL_SECONDS);
+  const seconds = Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_ACCEPTED_SYNC_INTERVAL_SECONDS;
+  return Math.round(seconds * 1000);
+}
+
+/** A stable per-account offset prevents all accounts polling in the same tick. */
+function accountJitterMs(accountId: string): number {
+  let hash = 0;
+  for (let i = 0; i < accountId.length; i++) hash = (hash * 31 + accountId.charCodeAt(i)) >>> 0;
+  return hash % (ACCEPTED_SYNC_JITTER_MS + 1);
+}
+
+function hasOutstandingSentInvitation(accountId: string): boolean {
+  const db = getDb();
+  const row = db.prepare(
+    `SELECT 1
+     FROM runs r
+     JOIN run_profiles rp ON rp.run_id = r.id
+     JOIN run_profile_tracks rt ON rt.run_profile_id = rp.id AND rt.track = 'linkedin'
+     JOIN targets t ON t.id = rp.target_id
+     WHERE r.account_id = ?
+       AND r.status = 'running'
+       AND rt.state = 'in_progress'
+       AND t.connection_requested_at IS NOT NULL
+       AND (t.degree IS NULL OR t.degree != 1)
+     LIMIT 1`
+  ).get(accountId);
+  return Boolean(row);
+}
+
 export function shouldSyncAccepted(accountId: string): boolean {
+  if (!hasOutstandingSentInvitation(accountId)) return false;
   const db = getDb();
   const row = db.prepare("SELECT accepted_sync_at FROM accounts WHERE id = ?").get(accountId) as
     | { accepted_sync_at: string | null }
     | undefined;
   if (!row?.accepted_sync_at) return true;
-  return Date.now() - new Date(row.accepted_sync_at).getTime() >= ACCEPTED_SYNC_INTERVAL_MS;
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(row.accepted_sync_at)
+    ? `${row.accepted_sync_at.replace(" ", "T")}Z`
+    : row.accepted_sync_at;
+  const lastSyncMs = Date.parse(normalized);
+  if (!Number.isFinite(lastSyncMs)) return true;
+  return Date.now() - lastSyncMs >= acceptedSyncIntervalMs() + accountJitterMs(accountId);
 }
 
 interface ApiConnection {
@@ -57,11 +102,21 @@ interface ApiConnection {
 }
 
 export async function syncAcceptedConnections(accountId: string): Promise<number> {
+  // Callers normally gate with shouldSyncAccepted(), but retain that safety at
+  // the exported operation too: a stale runner snapshot must not make us scan
+  // an account after its last outstanding invitation has resolved.
+  if (!hasOutstandingSentInvitation(accountId)) return 0;
+  if (syncingAccounts.has(accountId)) return 0;
+  syncingAccounts.add(accountId);
+
   const db = getDb();
-  const page = await getSessionPage(accountId);
+  let page: Page | null = null;
   let stamped = 0;
+  let validSession = false;
+  let sessionInvalid = false;
 
   try {
+    page = await getSessionPage(accountId);
     const boundaryRow = db.prepare("SELECT connections_synced_through_ms FROM accounts WHERE id = ?").get(accountId) as
       | { connections_synced_through_ms: number | null }
       | undefined;
@@ -80,6 +135,7 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
       console.warn(`[sync-accepted] Session looks logged out (${page.url()}) — skipping`);
       return 0;
     }
+    validSession = true;
     const declaredTotal = await page.evaluate(() => {
       const m = document.body.innerText.match(/([\d.,]+)\s+connections?/i);
       return m ? parseInt(m[1].replace(/[.,]/g, ""), 10) : null;
@@ -90,7 +146,19 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
        WHERE linkedin_url LIKE ? AND connection_requested_at IS NOT NULL`
     );
     const stampAccepted = db.prepare(
-      "UPDATE targets SET degree = 1, connected_at = COALESCE(connected_at, ?) WHERE id = ?"
+      "UPDATE targets SET degree = 1, connected_at = ? WHERE id = ?"
+    );
+    const wakeAcceptedTrack = db.prepare(
+      `UPDATE run_profile_tracks
+       SET next_step_at = datetime('now')
+       WHERE track = 'linkedin'
+         AND state = 'in_progress'
+         AND run_profile_id IN (
+           SELECT rp.id
+           FROM run_profiles rp
+           JOIN runs r ON r.id = rp.run_id
+           WHERE rp.target_id = ? AND r.account_id = ? AND r.status = 'running'
+         )`
     );
 
     const seenVanities = new Set<string>(); // full-pass phantom check
@@ -100,6 +168,11 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
 
     for (let pageIdx = 0; pageIdx < MAX_PAGES; pageIdx++) {
       const conns = await fetchConnectionsPage(page, pageIdx * PAGE_SIZE, PAGE_SIZE);
+      if (conns === "session-invalid") {
+        sessionInvalid = true;
+        console.warn(`[sync-accepted] connections API reported an invalid session at start=${pageIdx * PAGE_SIZE}`);
+        break;
+      }
       if (conns === null) {
         console.warn(`[sync-accepted] connections API failed at start=${pageIdx * PAGE_SIZE} — stopping`);
         break;
@@ -108,7 +181,7 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
 
       for (const c of conns) {
         uniquePulled++;
-        if (c.vanity) seenVanities.add(c.vanity);
+        if (c.vanity) seenVanities.add(c.vanity.toLowerCase());
         if (newestSeen === null || c.createdAt > newestSeen) newestSeen = c.createdAt;
 
         // Incremental early-exit (list is newest-first).
@@ -121,10 +194,16 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
         for (const m of findByVanity.all(`%/in/${c.vanity}/%`) as Array<{
           id: string; full_name: string | null; connected_at: string | null; degree: number | null;
         }>) {
-          if (m.degree === 1 && m.connected_at) continue; // already correct
-          stampAccepted.run(msToSqlite(c.createdAt), m.id);
-          console.log(`[sync-accepted] Accepted: ${m.full_name ?? c.vanity}`);
-          stamped++;
+          const connectedAt = msToSqlite(c.createdAt);
+          // LinkedIn's createdAt is authoritative and anchors the post-accept
+          // delay. Avoid needless writes for an already-correct target, but
+          // still wake its track in case an earlier tick parked it for 6 hours.
+          if (m.degree !== 1 || m.connected_at !== connectedAt) {
+            stampAccepted.run(connectedAt, m.id);
+            console.log(`[sync-accepted] Accepted: ${m.full_name ?? c.vanity}`);
+            stamped++;
+          }
+          wakeAcceptedTrack.run(m.id, accountId);
         }
       }
 
@@ -162,8 +241,10 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
       console.warn(`[sync-accepted] Full pass NOT verified complete (pulled ${uniquePulled}, declared ${declaredTotal}) — add-only, no un-marking.`);
     }
 
-    // Advance the boundary to the newest connection seen this run.
-    if (newestSeen !== null) {
+    // A failed initial checksum must remain a full pass on retry. Advancing it
+    // here would silently turn the next attempt into an incremental pass and
+    // permanently skip the verified phantom correction.
+    if (newestSeen !== null && (!isFullPass || verifiedComplete)) {
       db.prepare("UPDATE accounts SET connections_synced_through_ms = ? WHERE id = ?").run(newestSeen, accountId);
     }
     // Store the declared total for visibility (Settings shows LinkedIn's count).
@@ -174,15 +255,21 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
   } finally {
     // B5 safety: only persist the session if still on a valid page.
     let url = "";
-    try { url = page.url(); } catch { /* gone */ }
-    try { await page.close(); } catch { /* ignore */ }
-    if (/\/login|\/authwall|\/checkpoint|\/uas\//.test(url)) {
-      console.warn(`[sync-accepted] Ended on a wall (${url}) — not persisting; flagging re-auth`);
+    try { url = page?.url() ?? ""; } catch { /* gone */ }
+    try { await page?.close(); } catch { /* ignore */ }
+    const endedOnWall = /\/login|\/authwall|\/checkpoint|\/uas\//.test(url);
+    if (endedOnWall || sessionInvalid) {
+      console.warn(`[sync-accepted] Invalid session (${url || "connections API auth failure"}) — not persisting; flagging re-auth`);
       try { await markNeedsReauth(accountId); } catch { /* ignore */ }
-    } else {
+    } else if (page && validSession) {
       try { await saveSessionState(accountId); } catch { /* ignore */ }
     }
-    db.prepare("UPDATE accounts SET accepted_sync_at = datetime('now') WHERE id = ?").run(accountId);
+    // Do not write a successful poll timestamp for a login/checkpoint wall.
+    // That would both conceal the bad session and postpone recovery.
+    if (validSession && !endedOnWall && !sessionInvalid) {
+      db.prepare("UPDATE accounts SET accepted_sync_at = datetime('now') WHERE id = ?").run(accountId);
+    }
+    syncingAccounts.delete(accountId);
   }
 
   return stamped;
@@ -194,9 +281,9 @@ function msToSqlite(ms: number): string {
   return new Date(ms).toISOString().replace("T", " ").slice(0, 19);
 }
 
-async function fetchConnectionsPage(page: Page, start: number, count: number): Promise<ApiConnection[] | null> {
+async function fetchConnectionsPage(page: Page, start: number, count: number): Promise<ApiConnection[] | "session-invalid" | null> {
   return page.evaluate(
-    async ({ start, count, decoration }): Promise<ApiConnection[] | null> => {
+    async ({ start, count, decoration }): Promise<ApiConnection[] | "session-invalid" | null> => {
       const cookies = document.cookie.split("; ").reduce((a: Record<string, string>, c) => {
         const i = c.indexOf("=");
         if (i > 0) a[c.slice(0, i)] = c.slice(i + 1);
@@ -225,7 +312,8 @@ async function fetchConnectionsPage(page: Page, start: number, count: number): P
           },
           credentials: "include",
         });
-        if (!r.ok) return null;
+        if (!r.ok) return r.status === 401 ? "session-invalid" : null;
+        if (/\/login|\/authwall|\/checkpoint|\/uas\//.test(r.url)) return "session-invalid";
         json = await r.json();
       } catch {
         return null;

@@ -52,11 +52,13 @@ export interface PremiumSurface {
 
 function loadPremium(): PremiumSurface | null {
   try {
-    // Loaded by real path. The ee/ folder is imported IN PLACE (not copied) so its own
-    // relative imports resolve normally. In the public build this require throws → null.
+    // Loaded by real path in private builds. Public builds alias this import to a
+    // tiny null module in next.config.ts so the expected missing ee/ directory does
+    // not produce a bundler warning.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const mod = require("@/ee");
-    return (mod?.default ?? mod) as PremiumSurface;
+    const loaded = mod?.default ?? mod;
+    return loaded && typeof loaded === "object" ? loaded as PremiumSurface : null;
   } catch {
     return null; // public build: ee/ has been stripped
   }
